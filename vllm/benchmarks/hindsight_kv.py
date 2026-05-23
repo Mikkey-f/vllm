@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import statistics
 import time
@@ -134,16 +135,30 @@ def build_prompts() -> list[str]:
     ]
 
 
+def resolve_model_path(model: str) -> str:
+    if os.path.isdir(model):
+        return model
+    if model.startswith("/") or model.startswith("."):
+        return os.path.abspath(model)
+    return model
+
+
 def load_model_and_tokenizer(model: str):
-    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    model_path = resolve_model_path(model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        local_files_only=os.path.isdir(model_path),
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     llm = AutoModelForCausalLM.from_pretrained(
-        model,
+        model_path,
         torch_dtype=dtype,
         device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=True,
+        local_files_only=os.path.isdir(model_path),
     )
     llm.eval()
     return llm, tokenizer
