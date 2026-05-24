@@ -111,6 +111,7 @@ def load_model_and_tokenizer(model: str):
         model_path,
         dtype=dtype,
         device_map="auto" if torch.cuda.is_available() else None,
+        attn_implementation="eager",
         trust_remote_code=True,
         local_files_only=os.path.isdir(model_path),
     )
@@ -213,14 +214,29 @@ def extract_attention_profile(llm, tokenizer, prompt: str, completion: str) -> t
     inputs = {k: v.to(llm.device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = llm(**inputs, output_attentions=True, use_cache=False, return_dict=True)
-    attentions = outputs.attentions
-    if attentions is None:
-        raise RuntimeError("Model did not return attentions.")
 
-    # attentions: tuple[num_layers] with shape [batch, heads, seq, seq]
-    stacked = torch.stack([layer[0].mean(dim=0) for layer in attentions], dim=0)  # [layers, seq, seq]
+    attentions = getattr(outputs, "attentions", None)
+    if not attentions:
+        raise RuntimeError(
+            "Model did not return attentions. Check that attn_implementation='eager' is active and that the model is not fully offloaded."
+        )
+
+    layer_means: list[torch.Tensor] = []
+    for layer in attentions:
+        if layer is None or not torch.is_tensor(layer) or layer.numel() == 0:
+            continue
+        if layer.dim() < 4:
+            continue
+        layer_means.append(layer[0].mean(dim=0))
+
+    if not layer_means:
+        raise RuntimeError(
+            "Attention tensors were empty or unavailable. The backend may still be using sdpa, or offloading may prevent attention extraction."
+        )
+
+    stacked = torch.stack(layer_means, dim=0)  # [layers, seq, seq]
     mean_attn = stacked.mean(dim=0)  # [seq, seq]
-    received = mean_attn.mean(dim=0).detach().float().cpu().numpy()  # token-level received attention
+    received = mean_attn.mean(dim=0).detach().float().cpu().numpy()
     seq_len = received.shape[0]
     positions = token_positions(seq_len)
     return positions, received
