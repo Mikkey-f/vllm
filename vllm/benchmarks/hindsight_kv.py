@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Standalone HindsightKV v1.0 benchmark.
+"""Standalone HindsightKV benchmark.
 
-This version does not import the local vLLM source tree. It uses Hugging Face
-Transformers directly so it can run even when the cloned vLLM checkout cannot be
-built in editable mode.
+Three-phase workflow:
+  A. Generate once and persist outputs.
+  B. Re-analyze the same outputs under multiple baseline policies.
+  C. Emit lightweight runtime/analysis overhead statistics for future serving work.
 
-It also supports baseline retention policies so the same generated completions
-can be re-analyzed under multiple heuristics.
+This script intentionally does not import the local vLLM source tree.
+It uses Hugging Face Transformers directly so the benchmark can run even when
+editable installation of the repository is unavailable.
 """
 
 from __future__ import annotations
@@ -22,10 +24,13 @@ import statistics
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+BaselineName = Literal["hindsight", "random", "recency", "first_last", "uniform_topk"]
+ModeName = Literal["generate", "analyze", "compare", "full"]
 
 _REASONING_SPLIT_RE = re.compile(
     r"(?:\n\s*\n|\n(?:step\s*\d+[:.)-]?|therefore[:.,]?|thus[:.,]?|hence[:.,]?|next[:.,]?|finally[:.,]?)\s*)",
@@ -46,6 +51,7 @@ class BlockAnalysis:
 @dataclass
 class RequestAnalysis:
     request_id: int
+    prompt: str
     prompt_len: int
     completion_len: int
     block_count: int
@@ -56,19 +62,14 @@ class RequestAnalysis:
 
 
 @dataclass
-class BenchmarkSummary:
+class GenerationSummary:
     model: str
-    baseline: str
     num_requests: int
     elapsed_sec: float
     tokens_generated: int
     avg_completion_len: float
     avg_block_count: float
-    avg_retention_ratio: float
-    avg_compression_ratio: float
-    median_compression_ratio: float
-    p95_compression_ratio: float
-    request_results: list[RequestAnalysis]
+    generated_outputs: list[str]
 
 
 @dataclass
@@ -78,6 +79,31 @@ class BaselineSummary:
     avg_compression_ratio: float
     median_compression_ratio: float
     p95_compression_ratio: float
+
+
+@dataclass
+class CompareSummary:
+    baselines: list[BaselineSummary]
+
+
+@dataclass
+class PhaseCStats:
+    generation_elapsed_sec: float
+    analysis_elapsed_sec: float
+    compare_elapsed_sec: float
+    generation_throughput_tok_s: float
+    num_requests: int
+    num_outputs: int
+
+
+@dataclass
+class FullResult:
+    model: str
+    mode: str
+    generation: GenerationSummary
+    analyses: dict[str, list[RequestAnalysis]]
+    compare: CompareSummary | None
+    phase_c: PhaseCStats
 
 
 def split_reasoning_blocks(text: str) -> list[str]:
@@ -99,7 +125,7 @@ def token_score(token: str, position: int, block_len: int) -> float:
     return score
 
 
-def analyze_block(block_index: int, block_text: str, max_keep: int, baseline: str) -> BlockAnalysis:
+def analyze_block(block_index: int, block_text: str, max_keep: int, baseline: BaselineName) -> BlockAnalysis:
     tokens = block_text.split()
     if not tokens:
         return BlockAnalysis(block_index, 0, 0, 0.0, 0.0, 0.0)
@@ -137,10 +163,10 @@ def analyze_block(block_index: int, block_text: str, max_keep: int, baseline: st
 
 def analyze_completion(
     request_id: int,
-    prompt_len: int,
+    prompt: str,
     completion_text: str,
     block_token_budget: int,
-    baseline: str,
+    baseline: BaselineName,
 ) -> RequestAnalysis:
     blocks = split_reasoning_blocks(completion_text)
     block_analyses = [
@@ -152,7 +178,8 @@ def analyze_completion(
     compression_ratio = total_reasoning_tokens / retained_tokens if retained_tokens else math.inf
     return RequestAnalysis(
         request_id=request_id,
-        prompt_len=prompt_len,
+        prompt=prompt,
+        prompt_len=len(prompt.split()),
         completion_len=len(completion_text.split()),
         block_count=len(blocks),
         retained_tokens=retained_tokens,
@@ -199,17 +226,18 @@ def load_model_and_tokenizer(model: str):
     return llm, tokenizer
 
 
-def run_generation(
+def generate_outputs(
     model: str,
     max_tokens: int,
     temperature: float,
     top_p: float,
     num_requests: int,
-) -> tuple[list[str], float, int, float, float, int]:
+) -> tuple[list[dict[str, str]], GenerationSummary, float]:
     llm, tokenizer = load_model_and_tokenizer(model)
     base_prompts = build_prompts()
     prompts = [base_prompts[i % len(base_prompts)] for i in range(num_requests)]
 
+    records: list[dict[str, str]] = []
     outputs: list[str] = []
     start = time.perf_counter()
 
@@ -228,15 +256,54 @@ def run_generation(
             )
         prompt_len = int(inputs["input_ids"].shape[-1])
         completion_ids = generated[0][prompt_len:]
-        outputs.append(tokenizer.decode(completion_ids, skip_special_tokens=True))
+        completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+        outputs.append(completion_text)
+        records.append({"prompt": prompt, "completion": completion_text})
 
     elapsed = time.perf_counter() - start
-    tokens_generated = sum(len(o.split()) for o in outputs)
-    avg_completion_len = statistics.fmean(len(o.split()) for o in outputs) if outputs else 0.0
-    return outputs, elapsed, tokens_generated, avg_completion_len, 0.0, num_requests
+    tokens_generated = sum(len(item["completion"].split()) for item in records)
+    avg_completion_len = statistics.fmean(len(item["completion"].split()) for item in records) if records else 0.0
+    avg_block_count = statistics.fmean(len(split_reasoning_blocks(item["completion"])) for item in records) if records else 0.0
+    summary = GenerationSummary(
+        model=model,
+        num_requests=num_requests,
+        elapsed_sec=elapsed,
+        tokens_generated=tokens_generated,
+        avg_completion_len=avg_completion_len,
+        avg_block_count=avg_block_count,
+        generated_outputs=outputs,
+    )
+    return records, summary, elapsed
 
 
-def summarize_results(baseline: str, request_results: list[RequestAnalysis]) -> BaselineSummary:
+def analyze_records(
+    records: list[dict[str, str]],
+    block_token_budget: int,
+    baselines: list[BaselineName],
+) -> tuple[dict[str, list[RequestAnalysis]], CompareSummary, float]:
+    analyses: dict[str, list[RequestAnalysis]] = {}
+    summaries: list[BaselineSummary] = []
+    start = time.perf_counter()
+
+    for baseline in baselines:
+        request_results = [
+            analyze_completion(
+                request_id=idx,
+                prompt=record["prompt"],
+                completion_text=record["completion"],
+                block_token_budget=block_token_budget,
+                baseline=baseline,
+            )
+            for idx, record in enumerate(records)
+        ]
+        analyses[baseline] = request_results
+        summaries.append(summarize_baseline(baseline, request_results))
+
+    elapsed = time.perf_counter() - start
+    return analyses, CompareSummary(baselines=summaries), elapsed
+
+
+def summarize_baseline(baseline: BaselineName, request_results: list[RequestAnalysis]) -> BaselineSummary:
     retention_ratios = [
         (r.retained_tokens / r.total_reasoning_tokens) if r.total_reasoning_tokens else 0.0
         for r in request_results
@@ -260,132 +327,127 @@ def summarize_results(baseline: str, request_results: list[RequestAnalysis]) -> 
     )
 
 
-def run_benchmark(
-    model: str,
-    max_tokens: int,
-    temperature: float,
-    top_p: float,
-    block_token_budget: int,
-    num_requests: int,
-    output_json: str | None,
-    baseline: str,
-) -> BenchmarkSummary:
-    llm, tokenizer = load_model_and_tokenizer(model)
-    base_prompts = build_prompts()
-    prompts = [base_prompts[i % len(base_prompts)] for i in range(num_requests)]
+def print_generation_summary(summary: GenerationSummary) -> None:
+    print(f"Model: {summary.model}")
+    print(f"Requests: {summary.num_requests}")
+    print(f"Elapsed: {summary.elapsed_sec:.2f}s")
+    print(f"Generated tokens: {summary.tokens_generated}")
+    print(f"Avg completion length: {summary.avg_completion_len:.2f}")
+    print(f"Avg reasoning blocks: {summary.avg_block_count:.2f}")
 
-    request_results: list[RequestAnalysis] = []
-    outputs: list[str] = []
-    start = time.perf_counter()
 
-    for idx, prompt in enumerate(prompts):
-        inputs = tokenizer(prompt, return_tensors="pt")
-        inputs = {k: v.to(llm.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            generated = llm.generate(
-                **inputs,
-                do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
-                max_new_tokens=max_tokens,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        prompt_len = int(inputs["input_ids"].shape[-1])
-        completion_ids = generated[0][prompt_len:]
-        completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
-        outputs.append(completion_text)
-        request_results.append(
-            analyze_completion(
-                request_id=idx,
-                prompt_len=prompt_len,
-                completion_text=completion_text,
-                block_token_budget=block_token_budget,
-                baseline=baseline,
-            )
-        )
-
-    elapsed = time.perf_counter() - start
-    tokens_generated = sum(r.completion_len for r in request_results)
-    avg_completion_len = statistics.fmean(r.completion_len for r in request_results) if request_results else 0.0
-    avg_block_count = statistics.fmean(r.block_count for r in request_results) if request_results else 0.0
-    avg_retention_ratio = statistics.fmean(
-        (r.retained_tokens / r.total_reasoning_tokens) if r.total_reasoning_tokens else 0.0
-        for r in request_results
-    ) if request_results else 0.0
-    compression_ratios = [r.compression_ratio for r in request_results if math.isfinite(r.compression_ratio)]
-    avg_compression_ratio = statistics.fmean(compression_ratios) if compression_ratios else math.inf
-    median_compression_ratio = statistics.median(compression_ratios) if compression_ratios else math.inf
-    p95_compression_ratio = (
-        sorted(compression_ratios)[
-            max(0, min(len(compression_ratios) - 1, int(0.95 * len(compression_ratios)) - 1))
-        ]
-        if compression_ratios
-        else math.inf
-    )
-
-    summary = BenchmarkSummary(
-        model=model,
-        baseline=baseline,
-        num_requests=num_requests,
-        elapsed_sec=elapsed,
-        tokens_generated=tokens_generated,
-        avg_completion_len=avg_completion_len,
-        avg_block_count=avg_block_count,
-        avg_retention_ratio=avg_retention_ratio,
-        avg_compression_ratio=avg_compression_ratio,
-        median_compression_ratio=median_compression_ratio,
-        p95_compression_ratio=p95_compression_ratio,
-        request_results=request_results,
-    )
-
-    print(f"Model: {model}")
-    print(f"Baseline: {baseline}")
-    print(f"Requests: {num_requests}")
-    print(f"Elapsed: {elapsed:.2f}s")
-    print(f"Generated tokens: {tokens_generated}")
-    print(f"Avg completion length: {avg_completion_len:.2f}")
-    print(f"Avg reasoning blocks: {avg_block_count:.2f}")
-    print(f"Avg retention ratio: {avg_retention_ratio:.3f}")
-    print(f"Avg compression ratio: {avg_compression_ratio:.3f}")
-    print(f"Median compression ratio: {median_compression_ratio:.3f}")
-    print(f"P95 compression ratio: {p95_compression_ratio:.3f}")
-
-    if output_json:
-        payload: dict[str, Any] = asdict(summary)
-        payload["request_results"] = [asdict(r) for r in request_results]
-        payload["generated_outputs"] = outputs
-        payload["baseline_summary"] = asdict(summarize_results(baseline, request_results))
-        Path(output_json).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    return summary
+def print_compare_summary(compare: CompareSummary) -> None:
+    for item in compare.baselines:
+        print(f"Baseline: {item.baseline}")
+        print(f"  Avg retention ratio: {item.avg_retention_ratio:.3f}")
+        print(f"  Avg compression ratio: {item.avg_compression_ratio:.3f}")
+        print(f"  Median compression ratio: {item.median_compression_ratio:.3f}")
+        print(f"  P95 compression ratio: {item.p95_compression_ratio:.3f}")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="HindsightKV v1.0 benchmark")
+    parser = argparse.ArgumentParser(description="HindsightKV benchmark")
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--block-token-budget", type=int, default=32)
     parser.add_argument("--num-requests", type=int, default=3)
+    parser.add_argument("--mode", type=str, default="full", choices=["generate", "analyze", "compare", "full"])
     parser.add_argument("--baseline", type=str, default="hindsight", choices=["hindsight", "random", "recency", "first_last", "uniform_topk"])
+    parser.add_argument("--compare-baselines", type=str, default="hindsight,random,recency,first_last,uniform_topk")
+    parser.add_argument("--input-json", type=str, default=None)
     parser.add_argument("--output-json", type=str, default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    run_benchmark(
-        model=args.model,
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        block_token_budget=args.block_token_budget,
-        num_requests=args.num_requests,
-        output_json=args.output_json,
-        baseline=args.baseline,
+    baselines = [b.strip() for b in args.compare_baselines.split(",") if b.strip()]
+    baselines = [b for b in baselines if b in {"hindsight", "random", "recency", "first_last", "uniform_topk"}]
+
+    generation_summary: GenerationSummary | None = None
+    records: list[dict[str, str]]
+    generation_elapsed = 0.0
+
+    if args.mode in {"generate", "full"}:
+        records, generation_summary, generation_elapsed = generate_outputs(
+            model=args.model,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            num_requests=args.num_requests,
+        )
+        print_generation_summary(generation_summary)
+        print(f"Generation mode: {args.mode}")
+        if args.output_json:
+            payload = {
+                "model": args.model,
+                "mode": args.mode,
+                "generation": asdict(generation_summary),
+                "records": records,
+            }
+            Path(args.output_json).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    else:
+        if not args.input_json:
+            raise ValueError("--input-json is required for analyze/compare modes")
+        payload = json.loads(Path(args.input_json).read_text(encoding="utf-8"))
+        records = payload["records"]
+        if "generation" in payload:
+            generation_summary = GenerationSummary(**payload["generation"])
+
+    analyses: dict[str, list[RequestAnalysis]] = {}
+    compare_summary: CompareSummary | None = None
+    analysis_elapsed = 0.0
+    compare_elapsed = 0.0
+
+    if args.mode in {"analyze", "compare", "full"}:
+        if args.mode == "analyze":
+            selected = [args.baseline]
+        else:
+            selected = baselines
+        analyses, compare_summary, compare_elapsed = analyze_records(
+            records=records,
+            block_token_budget=args.block_token_budget,
+            baselines=selected,  # type: ignore[arg-type]
+        )
+        analysis_elapsed = compare_elapsed
+        print_compare_summary(compare_summary)
+
+    if args.mode == "full":
+        generation_elapsed = generation_summary.elapsed_sec if generation_summary else 0.0
+
+    phase_c = PhaseCStats(
+        generation_elapsed_sec=generation_elapsed,
+        analysis_elapsed_sec=analysis_elapsed,
+        compare_elapsed_sec=compare_elapsed,
+        generation_throughput_tok_s=(generation_summary.tokens_generated / generation_summary.elapsed_sec) if generation_summary and generation_summary.elapsed_sec > 0 else 0.0,
+        num_requests=len(records),
+        num_outputs=len(records),
     )
+
+    result = FullResult(
+        model=args.model,
+        mode=args.mode,
+        generation=generation_summary or GenerationSummary(
+            model=args.model,
+            num_requests=len(records),
+            elapsed_sec=generation_elapsed,
+            tokens_generated=sum(len(r["completion"].split()) for r in records),
+            avg_completion_len=statistics.fmean(len(r["completion"].split()) for r in records) if records else 0.0,
+            avg_block_count=statistics.fmean(len(split_reasoning_blocks(r["completion"])) for r in records) if records else 0.0,
+            generated_outputs=[r["completion"] for r in records],
+        ),
+        analyses=analyses,
+        compare=compare_summary,
+        phase_c=phase_c,
+    )
+
+    if args.output_json and args.mode != "generate":
+        Path(args.output_json).write_text(
+            json.dumps(asdict(result), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":
