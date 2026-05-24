@@ -36,6 +36,7 @@ import json
 import math
 import os
 import re
+import statistics
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -43,10 +44,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-try:
-    from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore[import-not-found]
-except Exception:  # pragma: no cover - optional dependency for synthetic-only usage
-    AutoModelForCausalLM = AutoTokenizer = None
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 _REASONING_SPLIT_RE = re.compile(
     r"(?:\n\s*\n|\n(?:step\s*\d+[:.)-]?|therefore[:.,]?|thus[:.,]?|hence[:.,]?|next[:.,]?|finally[:.,]?)\s*)",
@@ -100,8 +98,6 @@ def resolve_model_path(model: str) -> str:
 
 
 def load_model_and_tokenizer(model: str):
-    if AutoTokenizer is None or AutoModelForCausalLM is None:
-        raise RuntimeError("transformers is required for --model mode, but is not installed")
     model_path = resolve_model_path(model)
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
@@ -221,9 +217,10 @@ def extract_attention_profile(llm, tokenizer, prompt: str, completion: str) -> t
     if attentions is None:
         raise RuntimeError("Model did not return attentions.")
 
-    stacked = torch.stack([layer[0].mean(dim=0) for layer in attentions], dim=0)
-    mean_attn = stacked.mean(dim=0)
-    received = mean_attn.mean(dim=0).detach().float().cpu().numpy()
+    # attentions: tuple[num_layers] with shape [batch, heads, seq, seq]
+    stacked = torch.stack([layer[0].mean(dim=0) for layer in attentions], dim=0)  # [layers, seq, seq]
+    mean_attn = stacked.mean(dim=0)  # [seq, seq]
+    received = mean_attn.mean(dim=0).detach().float().cpu().numpy()  # token-level received attention
     seq_len = received.shape[0]
     positions = token_positions(seq_len)
     return positions, received
@@ -255,6 +252,7 @@ def build_position_summary(all_positions: list[np.ndarray], all_scores: list[np.
 def analyze(records: list[dict[str, str]], model: str | None, budget_tokens: int) -> tuple[AnalysisSummary, dict[str, Any]]:
     all_positions: list[np.ndarray] = []
     all_scores: list[np.ndarray] = []
+    per_block_stats = []
 
     llm = tokenizer = None
     if model:
@@ -272,6 +270,7 @@ def analyze(records: list[dict[str, str]], model: str | None, budget_tokens: int
                 scores = np.array([position_score_proxy(float(p)) for p in positions], dtype=float)
             all_positions.append(positions)
             all_scores.append(scores)
+            per_block_stats.append((len(scores), float(scores[0]) if len(scores) else 0.0, float(scores[len(scores) // 2]) if len(scores) else 0.0, float(scores[-1]) if len(scores) else 0.0))
 
     flat_scores = np.concatenate(all_scores) if all_scores else np.array([])
     flat_positions = np.concatenate(all_positions) if all_positions else np.array([])
@@ -290,16 +289,15 @@ def analyze(records: list[dict[str, str]], model: str | None, budget_tokens: int
     first_last_scores = []
     uniform_scores = []
     best_window_scores = []
-    for scores in all_scores:
+    for positions, scores in zip(all_positions, all_scores):
         n = len(scores)
         if n == 0:
             continue
-        budget = min(budget_tokens, n)
-        mask = scheduler_keep_mask(scores, budget)
+        mask = scheduler_keep_mask(scores, min(budget_tokens, n))
         scheduler_scores.append(float(scores[mask].sum() / scores.sum()))
-        first_last_scores.append(float(scores[first_last_keep(n, budget)].sum() / scores.sum()))
-        uniform_scores.append(float(scores[uniform_keep(n, budget)].sum() / scores.sum()))
-        best_window_scores.append(float(scores[contiguous_window_keep(scores, budget)].sum() / scores.sum()))
+        first_last_scores.append(float(scores[first_last_keep(n, min(budget_tokens, n))].sum() / scores.sum()))
+        uniform_scores.append(float(scores[uniform_keep(n, min(budget_tokens, n))].sum() / scores.sum()))
+        best_window_scores.append(float(scores[contiguous_window_keep(scores, min(budget_tokens, n))].sum() / scores.sum()))
 
     position_profile = build_position_summary(all_positions, all_scores)
     summary = AnalysisSummary(
@@ -342,6 +340,7 @@ def plot_results(payload: dict[str, Any], output_dir: str) -> None:
     plt.style.use("bmh")
     plt.rcParams["font.size"] = 13
 
+    # 1) position profile
     fig, ax = plt.subplots(figsize=(10, 6))
     bins = np.linspace(0, 1, 21)
     bin_ids = np.digitize(flat_pos, bins) - 1
@@ -361,6 +360,7 @@ def plot_results(payload: dict[str, Any], output_dir: str) -> None:
     fig.savefig(output / "attention_position_profile.png", dpi=200)
     plt.close(fig)
 
+    # 2) heatmap by block position
     max_len = max((len(s) for s in scores), default=0)
     heatmap = np.full((len(scores), max_len), np.nan)
     for i, s in enumerate(scores):
@@ -375,6 +375,7 @@ def plot_results(payload: dict[str, Any], output_dir: str) -> None:
     fig.savefig(output / "block_attention_heatmap.png", dpi=200)
     plt.close(fig)
 
+    # 3) scheduler comparison
     summary = payload["summary"]
     sched = summary["scheduler"]
     labels = ["best transport", "best contiguous window", "first+last", "uniform"]
@@ -398,43 +399,10 @@ def default_prompts() -> list[str]:
     ]
 
 
-def synthetic_completion(prompt: str, variant: int = 0) -> str:
-    templates = [
-        (
-            "First, identify the known quantities and isolate the unknown. "
-            "Next, apply the most direct formula and compute the intermediate result. "
-            "Finally, summarize the answer clearly with a short conclusion."
-        ),
-        (
-            "Start by restating the problem in simpler terms. Then perform the arithmetic or derivation step by step. "
-            "At the end, restate the answer concisely so the conclusion is easy to read."
-        ),
-        (
-            "We begin with the relevant definitions. After that, check the boundaries and compute the key value. "
-            "In the end, give the final result and the brief reasoning summary."
-        ),
-    ]
-    body = templates[variant % len(templates)]
-    return (
-        f"{body} Prompt reminder: {prompt} "
-        "Summary: the middle contains detailed derivation, while the first and last sentences are concise and salient."
-    )
-
-
-def build_synthetic_records(num_prompts: int) -> list[dict[str, str]]:
-    prompts = default_prompts()
-    records = []
-    for i in range(num_prompts):
-        prompt = prompts[i % len(prompts)]
-        records.append({"prompt": prompt, "completion": synthetic_completion(prompt, i)})
-    return records
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify thinkblock attention concentration at start/end positions")
     parser.add_argument("--input-json", type=str, default=None, help="JSON file containing records with prompt/completion")
     parser.add_argument("--model", type=str, default=None, help="Optional local or Hugging Face model path for real attention extraction")
-    parser.add_argument("--use-synthetic", action="store_true", help="Generate sample records locally without vLLM or a real model")
     parser.add_argument("--output-dir", type=str, default="thinkblock_attention_results")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.6)
@@ -448,11 +416,15 @@ def main() -> None:
     args = parse_args()
     records = read_records(args.input_json)
     if not records:
-        if args.use_synthetic or not args.model:
-            records = build_synthetic_records(args.num_prompts)
-        else:
-            prompts = default_prompts()[: args.num_prompts]
+        prompts = default_prompts()[: args.num_prompts]
+        if args.model:
             records = generate_records(args.model, prompts, args.max_tokens, args.temperature, args.top_p)
+        else:
+            # Fallback mode: use synthetic completions to validate the analysis pipeline.
+            records = [
+                {"prompt": p, "completion": "First, identify the relevant quantities. Then compute the intermediate value. Finally, summarize the answer clearly."}
+                for p in prompts
+            ]
 
     summary, payload = analyze(records, args.model, args.budget_tokens)
     plot_results(payload, args.output_dir)
