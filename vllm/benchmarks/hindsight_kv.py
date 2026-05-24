@@ -23,6 +23,8 @@ import re
 import statistics
 import time
 from dataclasses import asdict, dataclass
+
+from tqdm import tqdm
 from pathlib import Path
 from typing import Any, Literal
 
@@ -241,7 +243,7 @@ def generate_outputs(
     outputs: list[str] = []
     start = time.perf_counter()
 
-    for prompt in prompts:
+    for prompt in tqdm(prompts, desc="Generating", unit="req"):
         inputs = tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(llm.device) for k, v in inputs.items()}
         with torch.no_grad():
@@ -285,7 +287,7 @@ def analyze_records(
     summaries: list[BaselineSummary] = []
     start = time.perf_counter()
 
-    for baseline in baselines:
+    for baseline in tqdm(baselines, desc="Analyzing baselines", unit="baseline"):
         request_results = [
             analyze_completion(
                 request_id=idx,
