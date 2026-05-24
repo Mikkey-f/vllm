@@ -201,8 +201,25 @@ def load_model_and_tokenizer(model: str):
     return llm, tokenizer
 
 
-def generate_completion(llm, tokenizer, prompt: str, max_new_tokens: int, temperature: float, top_p: float) -> str:
-    inputs = tokenizer(prompt, return_tensors="pt")
+def truncate_text_by_tokens(tokenizer, text: str, max_tokens: int) -> str:
+    if max_tokens <= 0:
+        return text
+    token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    if len(token_ids) <= max_tokens:
+        return text
+    head_keep = max(1, max_tokens // 2)
+    tail_keep = max_tokens - head_keep
+    kept = token_ids[:head_keep] + token_ids[-tail_keep:] if tail_keep > 0 else token_ids[:head_keep]
+    return tokenizer.decode(kept, skip_special_tokens=True)
+
+
+def prepare_inputs(tokenizer, text: str, max_tokens: int):
+    truncated_text = truncate_text_by_tokens(tokenizer, text, max_tokens)
+    return tokenizer(truncated_text, return_tensors="pt")
+
+
+def generate_completion(llm, tokenizer, prompt: str, max_new_tokens: int, temperature: float, top_p: float, max_input_tokens: int) -> str:
+    inputs = prepare_inputs(tokenizer, prompt, max_input_tokens)
     inputs = {k: v.to(llm.device) for k, v in inputs.items()}
     with torch.no_grad():
         generated = llm.generate(
@@ -219,9 +236,9 @@ def generate_completion(llm, tokenizer, prompt: str, max_new_tokens: int, temper
     return tokenizer.decode(completion_ids, skip_special_tokens=True)
 
 
-def extract_attention_profile(llm, tokenizer, prompt: str, completion: str) -> tuple[np.ndarray, np.ndarray]:
+def extract_attention_profile(llm, tokenizer, prompt: str, completion: str, max_input_tokens: int) -> tuple[np.ndarray, np.ndarray]:
     text = prompt + completion
-    inputs = tokenizer(text, return_tensors="pt")
+    inputs = prepare_inputs(tokenizer, text, max_input_tokens)
     inputs = {k: v.to(llm.device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = llm(**inputs, output_attentions=True, use_cache=False, return_dict=True)
@@ -421,7 +438,7 @@ def infer_completion_and_metrics(prediction: str, gold: str) -> tuple[float, flo
     return em, f1, r_l
 
 
-def analyze(records: list[dict[str, Any]], model: str | None, budget_tokens: int, max_new_tokens: int, temperature: float, top_p: float, task_name: str) -> tuple[AnalysisSummary, dict[str, Any]]:
+def analyze(records: list[dict[str, Any]], model: str | None, budget_tokens: int, max_new_tokens: int, temperature: float, top_p: float, task_name: str, max_input_tokens: int) -> tuple[AnalysisSummary, dict[str, Any]]:
     all_positions: list[np.ndarray] = []
     all_scores: list[np.ndarray] = []
     predictions: list[str] = []
@@ -439,8 +456,8 @@ def analyze(records: list[dict[str, Any]], model: str | None, budget_tokens: int
         prompt = build_prompt(context, question, task_name)
 
         if llm is not None and tokenizer is not None:
-            pred = generate_completion(llm, tokenizer, prompt, max_new_tokens, temperature, top_p)
-            positions, scores = extract_attention_profile(llm, tokenizer, prompt, pred)
+            pred = generate_completion(llm, tokenizer, prompt, max_new_tokens, temperature, top_p, max_input_tokens)
+            positions, scores = extract_attention_profile(llm, tokenizer, prompt, pred, max_input_tokens)
         else:
             pred = f"synthetic answer for: {question[:32]}"
             text = prompt + pred
@@ -629,6 +646,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--budget-tokens", type=int, default=32)
     parser.add_argument("--num-samples", type=int, default=3, help="Number of synthetic samples when no data-path is given")
     parser.add_argument("--doc-tokens", type=int, default=2048, help="Synthetic document length in tokens")
+    parser.add_argument("--max-input-tokens", type=int, default=1024, help="Maximum input tokens kept before truncation for generation and attention extraction")
     parser.add_argument("--use-synthetic", action="store_true", help="Force synthetic LongBench-like samples")
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
@@ -654,6 +672,7 @@ def main() -> None:
         temperature=args.temperature,
         top_p=args.top_p,
         task_name=args.task_name,
+        max_input_tokens=args.max_input_tokens,
     )
     plot_results(payload, args.output_dir)
 
