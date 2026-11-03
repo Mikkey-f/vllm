@@ -5,6 +5,7 @@ import importlib
 from collections.abc import Callable
 from typing import TYPE_CHECKING, cast
 
+from vllm.config.kv_transfer import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.base import (
     KVConnectorBase,
     KVConnectorBaseType,
@@ -18,7 +19,6 @@ from vllm.utils.func_utils import supports_kw
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.config.kv_transfer import KVTransferConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
@@ -53,7 +53,7 @@ class KVConnectorFactory:
 
         # check if the connector supports HMA
         hma_enabled = not config.scheduler_config.disable_hybrid_kv_cache_manager
-        if hma_enabled and not supports_hma(connector_cls):
+        if hma_enabled and not cls.supports_hma_config(kv_transfer_config):
             raise ValueError(
                 f"Connector {connector_cls.__name__} does not support HMA but "
                 f"HMA is enabled. Please set `--disable-hybrid-kv-cache-manager`."
@@ -87,6 +87,7 @@ class KVConnectorFactory:
 
         Returns:
             The connector class.
+
         """
         if connector_name not in cls._registry:
             raise ValueError(f"Connector '{connector_name}' is not registered.")
@@ -122,10 +123,32 @@ class KVConnectorFactory:
                 logger.error(msg)
                 raise ValueError(msg)
         elif connector_name in cls._registry:
+            if connector_name == "NixlConnector":
+                mode = kv_transfer_config.get_from_extra_config("transfer_mode", "pull")
+                if mode not in ("pull", "push"):
+                    raise ValueError(f"Invalid NixlConnector transfer_mode: {mode!r}")
+                connector_name = f"Nixl{mode.capitalize()}Connector"
             connector_cls = cls._registry[connector_name]()
         else:
             raise ValueError(f"Unsupported connector type: {connector_name}")
         return connector_cls
+
+    @classmethod
+    def supports_hma_config(cls, kv_transfer_config: "KVTransferConfig") -> bool:
+        """Return whether this KV transfer config supports HMA.
+
+        MultiConnector is a special case: the wrapper class implements
+        SupportsHMA, but effective support depends on every configured child.
+        """
+        connector_cls = cls.get_connector_class(kv_transfer_config)
+        if kv_transfer_config.kv_connector != "MultiConnector":
+            return supports_hma(connector_cls)
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+            MultiConnector,
+        )
+
+        return MultiConnector.all_children_support_hma(kv_transfer_config)
 
 
 # Register various connectors here.
@@ -142,12 +165,6 @@ KVConnectorFactory.register_connector(
     "ExampleHiddenStatesConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.example_hidden_states_connector",
     "ExampleHiddenStatesConnector",
-)
-
-KVConnectorFactory.register_connector(
-    "P2pNcclConnector",
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_connector",
-    "P2pNcclConnector",
 )
 
 KVConnectorFactory.register_connector(
@@ -169,9 +186,27 @@ KVConnectorFactory.register_connector(
 )
 
 KVConnectorFactory.register_connector(
+    "NixlPullConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl",
+    "NixlPullConnector",
+)
+
+KVConnectorFactory.register_connector(
+    "NixlPushConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl",
+    "NixlPushConnector",
+)
+
+KVConnectorFactory.register_connector(
     "MultiConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector",
     "MultiConnector",
+)
+
+KVConnectorFactory.register_connector(
+    "HiSparseConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector",
+    "HiSparseConnector",
 )
 
 KVConnectorFactory.register_connector(
@@ -201,6 +236,11 @@ KVConnectorFactory.register_connector(
     "MooncakeStoreConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector",
     "MooncakeStoreConnector",
+)
+KVConnectorFactory.register_connector(
+    "UMBPStoreConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.umbp",
+    "UMBPStoreConnector",
 )
 KVConnectorFactory.register_connector(
     "FlexKVConnectorV1",

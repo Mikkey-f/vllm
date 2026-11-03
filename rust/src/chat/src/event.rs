@@ -1,7 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use std::ops::Deref;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use vllm_engine_core_client::protocol::output::RequestSpecDecodeMetrics;
+use vllm_llm::{RequestTimestamps, TokenUsage, WeightVersionSpan};
 use vllm_text::{DecodedLogprobs, DecodedPromptLogprobs};
 
 use crate::FinishReason;
@@ -53,6 +58,25 @@ impl AssistantContentBlock {
             _ => None,
         }
     }
+
+    /// Return a copy of this block with leading and trailing whitespace trimmed from all text
+    /// fields and tool call arguments, or `None` if the resulting text would be empty.
+    pub fn trim(mut self) -> Option<Self> {
+        match &mut self {
+            Self::Text { text } | Self::Reasoning { text } => {
+                let trimmed_text = text.trim();
+                if trimmed_text.is_empty() {
+                    return None;
+                } else {
+                    *text = trimmed_text.to_string();
+                }
+            }
+            Self::ToolCall(call) => {
+                call.arguments = call.arguments.trim().to_string();
+            }
+        }
+        Some(self)
+    }
 }
 
 #[easy_ext::ext(AssistantMessageExt)]
@@ -100,6 +124,37 @@ impl [AssistantContentBlock] {
     }
 }
 
+/// Chat-level token usage for one completed request.
+///
+/// Extends the engine-level [`TokenUsage`] with reasoning attribution measured
+/// by the chat output pipeline. [`TokenUsage`] itself stays engine-level and
+/// is not touched by parsing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChatTokenUsage {
+    /// Engine-level token usage.
+    pub engine: TokenUsage,
+    /// Number of generated tokens attributed to reasoning; 0 when the
+    /// configured parser has no reasoning channel.
+    pub reasoning_tokens: usize,
+}
+
+impl From<TokenUsage> for ChatTokenUsage {
+    fn from(engine: TokenUsage) -> Self {
+        Self {
+            engine,
+            reasoning_tokens: 0,
+        }
+    }
+}
+
+impl Deref for ChatTokenUsage {
+    type Target = TokenUsage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
+
 /// Final structured assistant message assembled from the event stream.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantMessage {
@@ -118,6 +173,13 @@ impl AssistantMessage {
     /// Push one new block to the end of the message content.
     pub(crate) fn push_block(&mut self, block: AssistantContentBlock) {
         self.content.push(block);
+    }
+
+    /// Return a copy of this message with leading and trailing whitespace trimmed from all text
+    /// fields and tool call arguments, and with any blocks that are empty after trimming removed.
+    pub fn trim(mut self) -> Self {
+        self.content = self.content.into_iter().filter_map(|block| block.trim()).collect();
+        self
     }
 }
 
@@ -142,6 +204,8 @@ pub enum ChatEvent {
         index: usize,
         kind: AssistantBlockKind,
         delta: String,
+        /// Number of generated tokens attributed to this delta, when available.
+        token_count: Option<usize>,
     },
     /// Per-decoded-update sample metadata: logprobs and/or output token IDs.
     LogprobsDelta {
@@ -171,13 +235,20 @@ pub enum ChatEvent {
     /// metadata.
     Done {
         message: AssistantMessage,
-        /// Number of prompt tokens actually sent to the engine after chat
-        /// template rendering and tokenization.
-        prompt_token_count: usize,
-        /// Number of output tokens generated.
-        output_token_count: usize,
+        usage: ChatTokenUsage,
+        /// Engine lifecycle times used by frontend response metrics.
+        timestamps: RequestTimestamps,
+        /// Per-request speculative-decoding statistics emitted by the engine.
+        spec_decode_metrics: Option<RequestSpecDecodeMetrics>,
         finish_reason: FinishReason,
         /// Connector-specific KV transfer parameters for disaggregated serving.
-        kv_transfer_params: Option<serde_json::Value>,
+        /// Boxed, like `ec_transfer_params`, to keep the per-token variants of
+        /// this enum small.
+        kv_transfer_params: Option<Box<serde_json::Value>>,
+        /// Connector-specific encoder cache transfer parameters for
+        /// disaggregated serving.
+        ec_transfer_params: Option<Box<serde_json::Value>>,
+        /// Weight-version spans over all generated token positions.
+        weight_versions: Option<Vec<WeightVersionSpan>>,
     },
 }

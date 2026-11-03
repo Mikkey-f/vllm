@@ -3,12 +3,12 @@
 import torch
 
 from vllm.config import VllmConfig
+from vllm.utils.import_utils import has_arctic_inference
 from vllm.v1.worker.gpu_input_batch import InputBatch
 
 
 class SuffixDecodingProposer:
-    """
-    Speculative decoding proposer for Suffix Decoding (https://arxiv.org/pdf/2411.04975).
+    """Speculative decoding proposer for Suffix Decoding (https://arxiv.org/pdf/2411.04975).
     This class imports and uses the official implementation from Arctic Inference
     (https://github.com/snowflakedb/ArcticInference).
     """
@@ -22,6 +22,12 @@ class SuffixDecodingProposer:
         self.min_token_prob = config.suffix_decoding_min_token_prob
         self.max_model_len = vllm_config.model_config.max_model_len
 
+        if not has_arctic_inference():
+            raise ImportError(
+                "Arctic Inference is required for suffix decoding on the V1 "
+                "model runner. Install via `pip install arctic-inference==0.1.1`, "
+                "or use Model Runner V2, which runs suffix decoding on the GPU."
+            )
         # Lazy import to avoid error when Suffix Decoding is not used.
         from arctic_inference.suffix_decoding import SuffixDecodingCache
 
@@ -34,12 +40,14 @@ class SuffixDecodingProposer:
 
     def propose(
         self,
+        num_speculative_tokens: int,
         input_batch: InputBatch,
         sampled_token_ids: list[list[int]],
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,  # unused
     ) -> list[list[int]]:
+        assert num_speculative_tokens == self.num_speculative_tokens
         """
         Propose speculative tokens for each request in the input batch. Suffix Decoding
         will speculate a dynamic number of tokens for each request every decoding step,
